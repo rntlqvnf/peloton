@@ -48,10 +48,7 @@ bool SKIPLIST_INDEX_TYPE::InsertEntry( const storage::Tuple *key,
   KeyType index_key;
   index_key.SetFromKey(key);
 
-  printf("INSERT\n");
   bool ret = container.Insert(index_key, value);
-  printf("INSERT OUT\n");
-
   return ret;
 }
 
@@ -68,10 +65,7 @@ bool SKIPLIST_INDEX_TYPE::DeleteEntry(
   KeyType index_key;
   index_key.SetFromKey(key);
 
-  printf("DELETE\n");
   bool ret = container.Delete(index_key, value);
-  printf("DELETE OUT\n");
-
   return ret;
 }
 
@@ -105,7 +99,7 @@ void SKIPLIST_INDEX_TYPE::Scan(
     UNUSED_ATTRIBUTE const std::vector<type::Value> &value_list,
     UNUSED_ATTRIBUTE const std::vector<oid_t> &tuple_column_id_list,
     UNUSED_ATTRIBUTE const std::vector<ExpressionType> &expr_list,
-    UNUSED_ATTRIBUTE ScanDirectionType scan_direction,
+    ScanDirectionType scan_direction,
     std::vector<ValueType> &result,
     const ConjunctionScanPredicate *csp_p) {
   // TODO: Add your implementation here
@@ -164,6 +158,30 @@ void SKIPLIST_INDEX_TYPE::ScanLimit(
     UNUSED_ATTRIBUTE const ConjunctionScanPredicate *csp_p,
     UNUSED_ATTRIBUTE uint64_t limit, UNUSED_ATTRIBUTE uint64_t offset) {
   // TODO: Add your implementation here
+  if (csp_p->IsPointQuery() == false && limit == 1 && offset == 0 &&
+      scan_direction == ScanDirectionType::FORWARD) {
+    const storage::Tuple *low_key_p = csp_p->GetLowKey();
+    const storage::Tuple *high_key_p = csp_p->GetHighKey();
+
+    LOG_TRACE("ScanLimit() special case (limit = 1; offset = 0; ASCENDING): %s",
+              low_key_p->GetInfo().c_str());
+
+    KeyType index_low_key;
+    KeyType index_high_key;
+    index_low_key.SetFromKey(low_key_p);
+    index_high_key.SetFromKey(high_key_p);
+
+    auto scan_itr = container.Begin(index_low_key);
+    if ((scan_itr.IsEnd() == false) &&
+        (container.KeyCmpLessEqual(scan_itr->first, index_high_key))) {
+
+      result.push_back(scan_itr->second);
+    }
+  } else {
+    Scan(value_list, tuple_column_id_list, expr_list, scan_direction, result,
+         csp_p);
+  }
+
   return;
 }
 
@@ -172,7 +190,6 @@ void SKIPLIST_INDEX_TYPE::ScanAllKeys(std::vector<ValueType> &result) {
   auto it = container.Begin();
 
   while (it.IsEnd() == false) {
-    printf("VALUE %p\n", it->second);
     result.push_back(it->second);
     it++;
   }

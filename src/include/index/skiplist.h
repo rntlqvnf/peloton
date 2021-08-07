@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <functional>
 #include <utility>
+#include <thread>
+#include <cassert>
 #include <atomic>
 
 namespace peloton {
@@ -34,10 +36,13 @@ class SkipList {
   // TODO: Add your declarations here
   public:
     class SkipNode;
+    class EpochManager;
 
     using KeyValuePair = std::pair<KeyType, ValueType>;
 
     using AtomSkipNode = std::atomic<SkipNode*>;
+
+    using EpochNode = typename EpochManager::EpochNode;
 
   public:
     class SkipNode {
@@ -54,6 +59,10 @@ class SkipList {
           deleted.store(false);
           forward = new AtomSkipNode[level + 1];
           for(int i = 0; i <= level; i++) forward[i].store(nullptr);
+        }
+
+        ~SkipNode() {
+          delete [] forward;
         }
     };
 
@@ -76,6 +85,8 @@ class SkipList {
 
     // Check whether values are equivalent
     const ValueEqualityChecker value_eq_obj;
+
+    EpochManager epoch_manager;
 
   public:
     inline bool KeyCmpLess(const KeyType &key1, const KeyType &key2) const {
@@ -134,7 +145,8 @@ class SkipList {
       cur_level(0),
       key_cmp_obj{p_key_cmp_obj},
       key_eq_obj{p_key_eq_obj},
-      value_eq_obj{p_value_eq_obj} {
+      value_eq_obj{p_value_eq_obj},
+      epoch_manager{this} {
       KeyType dummy_key;
       ValueType dummy_value = nullptr;
 
@@ -147,19 +159,145 @@ class SkipList {
     }
 
     ~SkipList() {
-      return;
+      delete head;
+      delete tail;
     }
 
     inline bool IsTailOrNull(SkipNode* node) {
       return node == nullptr || node->forward[0].load() == nullptr;
-    }    
+    }   
+
+    bool Insert(const KeyType &key, const ValueType &value) {
+      EpochNode *epoch_node_p = epoch_manager.JoinEpoch();
+
+      bool result;
+      if(!CanInsert(key, value)) {
+        result =  false;
+      }
+      else {
+        int level = RandomLevel();
+        if(level > cur_level) cur_level = level;
+
+        result = InsertNodes(key, value, level);
+      }
+
+      epoch_manager.LeaveEpoch(epoch_node_p);
+      return result;
+    }
+
+    bool ConditionalInsert(const KeyType &key,
+                            const ValueType &value,
+                            std::function<bool(const void *)> predicate,
+                            bool *predicate_satisfied) {
+      ConditionalFind(key, predicate, predicate_satisfied);
+      if(*predicate_satisfied == true) return false;
+
+      return Insert(key, value);
+    }
+
+    bool Delete(const KeyType &key, const ValueType &value) {
+      EpochNode *epoch_node_p = epoch_manager.JoinEpoch();
+      bool result = DeleteNodes(key, value);
+      epoch_manager.LeaveEpoch(epoch_node_p);
+      return result;
+    }
+
+    bool DeleteNodes(const KeyType &key, const ValueType &value) {
+      SkipNode* node = Find(key, value);
+      SkipNode* update[MAX_LEVEL] = {nullptr};
+      bool cas_result, deleted;
+      if(node == nullptr) {
+        return false;
+      }
+
+      deleted = node->deleted.load();
+      if(deleted) return false;
+
+      cas_result = node->deleted.compare_exchange_strong(deleted, true);
+      if(!cas_result) return false;
+
+      UpdateList(key, value, update, node->level);
+      for(int i = node->level; i >= 0;) {
+        cas_result = DeleteNode(node, update, i);
+        if(!cas_result) {
+          UpdateList(key, value, update, node->level);
+          continue;
+        }
+        else {
+          i--;
+        }
+      }
+
+      epoch_manager.AddGarbageNode(node);
+      ResetCurLevel();
+      return true;
+    }
+
+    bool InsertNodes(const KeyType &key, const ValueType &value, int level) {
+      SkipNode* node = new SkipNode(std::make_pair(key, value), level);
+      SkipNode* update[MAX_LEVEL] = {nullptr};
+      ERROR cas_result;
+
+      while(1) { 
+        UpdateList(key, update);
+        cas_result = InsertNode(node, update, 0);
+        if(cas_result == REDUPLICATE) {
+          delete node;
+          return false;
+        }
+        else if(cas_result == CAS_FAILED || cas_result == DELETED) {
+          continue;
+        }
+        else {
+          break;
+        }
+      }
+
+      for(int i = 1; i <= level; ) {
+        cas_result = InsertNode(node, update, i);
+        if(cas_result == CAS_FAILED || cas_result == DELETED) {
+          UpdateList(key, update); 
+        }
+        else {
+          i++;
+        }
+      }
+      
+      return true;
+    }
+
+
+    ERROR InsertNode(SkipNode* node, SkipNode* update[MAX_LEVEL], int i) {
+      SkipNode* prev_node = update[i];
+      SkipNode* prev_p = update[i]->forward[i].load();
+      
+      if(i == 0 && !CanInsert(node->item.first, node->item.second)) return REDUPLICATE; 
+      if(prev_node->deleted.load()) return DELETED;
+
+      node->forward[i].store(prev_p);
+      bool cas_result = update[i]->forward[i].compare_exchange_strong(prev_p, node);
+
+      return cas_result ? NO_ERROR : CAS_FAILED;
+    }
+
+    bool DeleteNode(SkipNode* node, SkipNode* update[MAX_LEVEL], int i) {
+      return update[i]->forward[i].compare_exchange_strong(node, node->forward[i].load());
+    }
+
+    bool CanInsert(const KeyType &key, const ValueType &value) {
+      SkipNode* node_p = unique_keys ? MoveTo(key) : Find(key, value);
+      if(IsTailOrNull(node_p)) {
+        return true;
+      }
+      else {
+        return false;
+      }
+    }
 
     int RandomLevel () {
       int v = 1;
 
-      while ((((double)std::rand() / RAND_MAX)) < 0.5 && 
-            std::abs(v) < MAX_LEVEL) {
-
+      while ((((double)std::rand() / RAND_MAX)) < 0.5 && std::abs(v) < MAX_LEVEL) {
           v += 1;
       }
       return abs(v);
@@ -185,10 +323,10 @@ class SkipList {
       }
     }
       
-    void UpdateList(const KeyType &key, const ValueType &value, SkipNode* update[MAX_LEVEL]) {
+    void UpdateList(const KeyType &key, const ValueType &value, SkipNode* update[MAX_LEVEL], int level) {
       SkipNode* prev = head;
       SkipNode* x = head;
-      for(int i = cur_level; i >= 0; i--) {
+      for(int i = level; i >= 0; i--) {
         while (!IsTailOrNull(x->forward[i].load()) && KeyCmpGreaterEqual(key, x->forward[i].load()->item.first)) {
           if(ObjCmpEqual(x->forward[i].load()->item.first, key, x->forward[i].load()->item.second, value)) break;
           prev = x;
@@ -202,20 +340,34 @@ class SkipList {
     SkipNode* MoveTo(const KeyType &key) {
       SkipNode* x = head;
       for(int i = cur_level; i >= 0; i--) {
-        while (!IsTailOrNull(x->forward[i].load()) & KeyCmpLessEqual(x->forward[i].load()->item.first, key)) {
+        while (!IsTailOrNull(x->forward[i].load()) && KeyCmpGreater(key, x->forward[i].load()->item.first)) {
           x = x->forward[i].load();
-          if(KeyCmpEqual(x->item.first, key)) break;
         }
       }
-      return x == head ? x->forward[0].load() : x; //
+
+      if(x == head) x = x->forward[0].load();
+      while(!IsTailOrNull(x)) { 
+        if(KeyCmpLessEqual(key, x->item.first)) {
+          break;
+        }
+        else {
+          x = x->forward[0].load();
+        }
+      }
+
+      return x;
     }
 
     void GetValue(const KeyType &key, std::vector<ValueType> &result) {
+      EpochNode *epoch_node_p = epoch_manager.JoinEpoch();
+
       SkipNode* x = MoveTo(key);
       while(!IsTailOrNull(x) && KeyCmpEqual(x->item.first, key) == true) {
         result.push_back(x->item.second);
         x = x->forward[0].load();
       }
+
+      epoch_manager.LeaveEpoch(epoch_node_p);
     }
 
     SkipNode* Find(const KeyType &key, const ValueType& value) {
@@ -235,140 +387,21 @@ class SkipList {
       return nullptr;
     }
 
-    SkipNode* ConditionalFind(const KeyType &key, 
-                              const ValueType &value,
+    void ConditionalFind(const KeyType &key,
                               std::function<bool(const void *)> predicate,
                               bool *predicate_satisfied) {
       std::vector<ValueType> result;
       GetValue(key, result);
 
       *predicate_satisfied = false;
-      for (auto it = begin (result); it != end (result); ++it) {
+      for (auto it = begin (result); it != end (result); it++) {
         if(predicate((*it)) == true) {
           *predicate_satisfied = true;
           break;
         }
       }
-
-      return Find(key, value);
     } 
 
-
-    bool CanInsert(const KeyType &key, const ValueType &value) {
-      SkipNode* node_p = Find(key, value);
-      if(node_p != nullptr) {
-        return false;
-      }
-      else {
-        return true;
-      }
-    }
-
-    ERROR InstallNode(SkipNode* node, SkipNode* update[MAX_LEVEL], int i) {
-      SkipNode* prev_node = update[i];
-      SkipNode* prev_p = update[i]->forward[i].load();
-      
-      if(i == 0 && !CanInsert(node->item.first, node->item.second)) return REDUPLICATE; 
-      if(prev_node->deleted.load()) return DELETED;
-
-      node->forward[i].store(prev_p);
-      bool cas_result = update[i]->forward[i].compare_exchange_strong(prev_p, node);
-
-      printf("node %p\n", node);
-      printf("update %p\n", update[i]->forward[i].load());
-
-      return cas_result ? NO_ERROR : CAS_FAILED;
-    }
-
-    bool InstallNodes(const KeyType &key, const ValueType &value, int level) {
-      SkipNode* node = new SkipNode(std::make_pair(key, value), level);
-      SkipNode* update[MAX_LEVEL] = {nullptr};
-      ERROR cas_result;
-
-      while(1) { 
-        UpdateList(key, update);
-        cas_result = InstallNode(node, update, 0);
-        if(cas_result == REDUPLICATE) {
-          delete node;
-          return false;
-        }
-        else if(cas_result == CAS_FAILED || cas_result == DELETED) {
-          continue;
-        }
-        else {
-          break;
-        }
-      }
-
-      for(int i = 1; i <= level; ) {
-        cas_result = InstallNode(node, update, i);
-        if(cas_result == CAS_FAILED || cas_result == DELETED) {
-          UpdateList(key, update); 
-        }
-        else {
-          i++;
-        }
-      }
-      
-      return true;
-    }
-
-    bool Insert(const KeyType &key, const ValueType &value) {
-      if(!CanInsert(key, value)) return false;
-
-      int level = RandomLevel();
-      if(level > cur_level) cur_level = level;
-
-      return InstallNodes(key, value, level);
-    }
-
-    bool ConditionalInsert(const KeyType &key,
-                            const ValueType &value,
-                            std::function<bool(const void *)> predicate,
-                            bool *predicate_satisfied) {
-      SkipNode* node_p = ConditionalFind(key, value, predicate, predicate_satisfied);
-      if(*predicate_satisfied == true) {
-        return false;
-      } else if(node_p != nullptr) {
-        return false;
-      }
-
-      int level = RandomLevel();
-      if(level > cur_level) cur_level = level;
-
-      return InstallNodes(key, value, level);
-    }
-
-    bool DeleteNode(SkipNode* node, SkipNode* update[MAX_LEVEL], int i) {
-      return update[i]->forward[i].compare_exchange_strong(node, node->forward[i].load());
-    }
-
-    bool Delete(const KeyType &key, const ValueType &value) {
-      SkipNode* node = Find(key, value);
-      SkipNode* update[MAX_LEVEL] = {nullptr};
-      bool cas_result;
-      bool deleted = node->deleted.load();
-      if(node == nullptr || deleted) {
-        return false;
-      }
-      else {
-        node->deleted.compare_exchange_strong(deleted, true);
-      }
-
-      for(int i = node->level; i >= 0;) {
-        UpdateList(key, value, update);
-        cas_result = DeleteNode(node, update, node->level);
-        if(!cas_result) {
-          continue;
-        }
-        else {
-          i--;
-        }
-      }
-
-      ResetCurLevel();
-      return true;
-    }
 
     class ForwardIterator{
       private:
@@ -405,8 +438,8 @@ class SkipList {
           }
         }
 
-        inline const KeyValuePair &operator*() {
-          return cursor->item;
+        inline const SkipNode* operator*() {
+          return cursor;
         }
 
         inline const KeyValuePair *operator->() {
@@ -465,6 +498,197 @@ class SkipList {
           return temp;
         }
     };
+
+    class EpochManager {
+      private:
+        SkipList *slist_p;
+
+      public:
+        struct GarbageNode {
+          const SkipNode *node_p;
+
+          GarbageNode *next_p;
+        };
+
+        struct EpochNode {
+          std::atomic<int> active_thread_count;
+
+          std::atomic<GarbageNode *> garbage_list_p;
+
+          EpochNode *next_p;
+        };
+
+        EpochNode *head_epoch_p;
+        EpochNode *current_epoch_p;
+
+        EpochManager(SkipList *p_slist_p) :
+          slist_p{p_slist_p} {
+          current_epoch_p = new EpochNode();
+
+          current_epoch_p->active_thread_count.store(0);
+          current_epoch_p->garbage_list_p.store(nullptr);
+          current_epoch_p->next_p = nullptr;
+
+          head_epoch_p = current_epoch_p;
+
+          return;
+        }
+
+        ~EpochManager() {
+          current_epoch_p = nullptr;
+
+          ClearEpoch();
+          
+          if(head_epoch_p != nullptr) {
+            for(EpochNode *epoch_node_p = head_epoch_p;
+                epoch_node_p != nullptr;
+                epoch_node_p = epoch_node_p->next_p) {
+              epoch_node_p->active_thread_count = 0;
+            }
+
+            ClearEpoch();
+          }
+        }
+
+        void CreateNewEpoch() {
+          EpochNode *epoch_node_p = new EpochNode{};
+
+          epoch_node_p->active_thread_count.store(0);
+          epoch_node_p->garbage_list_p.store(nullptr);
+          epoch_node_p->next_p = nullptr;
+
+          current_epoch_p->next_p = epoch_node_p;
+          current_epoch_p = epoch_node_p;
+
+          return;
+        }
+
+        void AddGarbageNode(const SkipNode *node_p) {
+          EpochNode *epoch_p = current_epoch_p;
+
+          GarbageNode *garbage_node_p = new GarbageNode;
+          garbage_node_p->node_p = node_p;
+          garbage_node_p->next_p = epoch_p->garbage_list_p.load();
+
+          while(1) {
+            bool ret = epoch_p->garbage_list_p.compare_exchange_strong(garbage_node_p->next_p, garbage_node_p);
+
+            if(ret == true) {
+              break;
+            } 
+          }
+
+          return;
+        } 
+
+        inline EpochNode *JoinEpoch() {
+          EpochNode *epoch_p;
+          do {
+            epoch_p = current_epoch_p;
+
+            int64_t prev_count = epoch_p->active_thread_count.fetch_add(1);
+
+            if(prev_count < 0) {
+              epoch_p->active_thread_count.fetch_sub(1);
+            }
+            else {
+              break;
+            }
+          } while(1);
+
+          return epoch_p;
+        }
+
+        inline void LeaveEpoch(EpochNode *epoch_p) {
+          epoch_p->active_thread_count.fetch_sub(1);
+          return;
+        }
+        
+        void PerformGarbageCollection() {
+          CreateNewEpoch();
+          ClearEpoch();
+          
+          return;
+        }
+
+        void ClearEpoch() {
+          while(1) {
+            if(head_epoch_p == current_epoch_p) {
+              break;
+            }
+
+            int active_thread_count = head_epoch_p->active_thread_count.load();
+            assert(active_thread_count >= 0);
+
+            if(active_thread_count != 0) {
+              break;
+            }
+
+            const GarbageNode *next_garbage_node_p = nullptr;
+
+            for(const GarbageNode *garbage_node_p = head_epoch_p->garbage_list_p.load();
+                garbage_node_p != nullptr;
+                garbage_node_p = next_garbage_node_p) {
+              FreeSkipNode(garbage_node_p->node_p);
+              next_garbage_node_p = garbage_node_p->next_p;
+              delete garbage_node_p;
+            } 
+
+            EpochNode *next_epoch_node_p = head_epoch_p->next_p;
+            delete head_epoch_p;
+            head_epoch_p = next_epoch_node_p;
+          } 
+
+          return;
+        }
+
+        void FreeSkipNode(const SkipNode *node_p) {
+          delete node_p;
+        }
+
+        size_t GetMemoryFootprint() {
+          return GetActiveNodeMemory() + GetDeadNodeMemory();
+        }
+
+        size_t GetActiveNodeMemory() {
+          size_t size = 0;
+          for (auto scan_itr = slist_p->Begin(); scan_itr.IsEnd() == false; scan_itr++) {
+            size += sizeof(SkipNode*) + sizeof(SkipNode) + ((*scan_itr)->level + 1) * sizeof(AtomSkipNode);
+          }
+          return size;
+        }
+
+        size_t GetDeadNodeMemory() {
+          size_t size = 0;
+          const GarbageNode *next_garbage_node_p = nullptr;
+
+          for(EpochNode *epoch_node_p = head_epoch_p;
+              epoch_node_p != nullptr;
+              epoch_node_p = epoch_node_p->next_p) {
+            for(const GarbageNode *garbage_node_p = epoch_node_p->garbage_list_p.load();
+                garbage_node_p != nullptr;
+                garbage_node_p = next_garbage_node_p) {
+              size += sizeof(SkipNode*) + sizeof(SkipNode) + (garbage_node_p->node_p->level + 1) * sizeof(AtomSkipNode);
+              next_garbage_node_p = garbage_node_p->next_p;
+            } 
+          }
+
+          return size;
+        }
+    };
+
+    size_t GetMemoryFootprint() {
+      return epoch_manager.GetMemoryFootprint();
+    }
+
+    void PerformGarbageCollection() {
+      epoch_manager.PerformGarbageCollection();
+      return;
+    }
+
+    bool NeedGarbageCollection() {
+      return (epoch_manager.GetDeadNodeMemory() > 0);
+    }
 };
 }  // End index namespace
 }  // End peloton namespace
